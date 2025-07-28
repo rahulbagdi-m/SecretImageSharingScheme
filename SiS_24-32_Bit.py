@@ -1,0 +1,138 @@
+import numpy as np
+import cv2
+import random
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim
+from scipy.stats import entropy
+import pydicom
+import os
+from tqdm import tqdm
+
+PRIME_32BIT = (1 << 32) + 15  # 4294967311 (prime > 2^32 or can use prime as suggested in paper)
+PRIME_24BIT = (1 << 24) - 3   # 16777213 (prime < 2^24 or can use prime as suggested in paper)
+SHARE_BYTES = 8  # Each share (x,y) stored as two 32-bit integers (8 bytes)
+
+
+def load_image(image_path: str) -> np.ndarray:
+    """Load an image, handling both grayscale (16-bit) and color (24-bit)."""
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    ext = os.path.splitext(image_path)[1].lower()
+    try:
+        if ext == '.dcm':
+            ds = pydicom.dcmread(image_path)
+            img = ds.pixel_array.astype(np.uint16)  # 16-bit grayscale
+        else:
+            img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError("Unsupported or invalid image format.")
+            if len(img.shape) == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Convert to RGB
+        return img
+    except Exception as e:
+        raise RuntimeError(f"Image loading failed: {str(e)}") from e
+
+def modinv(a: int, mod: int) -> int:
+    """Modular inverse using Extended Euclidean Algorithm."""
+    a = a % mod
+    if a == 0:
+        raise ValueError("Modular inverse undefined for zero.")
+    
+    lm, hm = 1, 0
+    low, high = a, mod
+    
+    while low > 1:
+        ratio = high // low
+        nm = hm - lm * ratio
+        new = high - low * ratio
+        lm, low, hm, high = nm, new, lm, low
+        
+    return lm % mod
+
+def generate_shares(secret: int, k: int, n: int, prime: int) -> list:
+    """Generate Shamir shares."""
+    coeffs = [secret] + [random.randint(0, prime-1) for _ in range(k-1)]
+    shares = [(x, sum(coeff * pow(x, j, prime) for j, coeff in enumerate(coeffs)) % prime) for x in range(1, n+1)]
+    return shares
+
+def reconstruct_secret(shares: list, prime: int) -> int:
+    """Reconstruct secret from shares."""
+    secret = 0
+    for i, (xi, yi) in enumerate(shares):
+        li = 1
+        for j, (xj, _) in enumerate(shares):
+            if i != j:
+                li = (li * xj * modinv((xj - xi) % prime, prime)) % prime
+        secret = (secret + yi * li) % prime
+    return secret
+
+def pixels_to_secrets(image: np.ndarray) -> list:
+    """Convert image pixels to secrets based on bit-depth."""
+    if image.dtype == np.uint16:
+        flat = image.ravel()
+        secrets = (flat[::2].astype(np.uint32) << 16) | flat[1::2].astype(np.uint32)
+        return secrets.tolist(), PRIME_32BIT
+    else:
+        r, g, b = image[..., 0], image[..., 1], image[..., 2]
+        secrets = ((r.astype(np.uint32) << 16) | (g.astype(np.uint32) << 8) | b.astype(np.uint32)).ravel()
+        return secrets.tolist(), PRIME_24BIT
+
+def secrets_to_pixels(secrets: list, image_shape: tuple, is_color: bool) -> np.ndarray:
+    """Convert secrets back to image pixels."""
+    secrets = np.array(secrets, dtype=np.uint32)
+    if is_color:
+        r = (secrets >> 16).astype(np.uint8)
+        g = ((secrets >> 8) & 0xFF).astype(np.uint8)
+        b = (secrets & 0xFF).astype(np.uint8)
+        return np.stack((r, g, b), axis=-1).reshape(image_shape)
+    else:
+        high = (secrets >> 16).astype(np.uint16)
+        low = (secrets & 0xFFFF).astype(np.uint16)
+        return np.column_stack((high, low)).ravel().reshape(image_shape)
+
+def main():
+   
+    IMAGE_PATH='/Users/PathToImage/Img.jpg'
+    K, N = 3, 5
+    
+    print("Loading image...")
+    image = load_image(IMAGE_PATH)
+    is_color = image.ndim == 3
+    
+    print("Converting pixels to secrets...")
+    secrets, prime = pixels_to_secrets(image)
+    
+    print(f"Generating shares (k={K}, n={N})...")
+    share_groups = [generate_shares(s, K, N, prime) for s in tqdm(secrets, desc="Sharing")]
+    
+    print("Reconstructing secrets...")
+    reconstructed_secrets = [reconstruct_secret(shares[:K], prime) for shares in tqdm(share_groups, desc="Reconstructing")]
+    
+    print("Converting secrets back to pixels...")
+    reconstructed_image = secrets_to_pixels(reconstructed_secrets, image.shape, is_color)
+    
+    print("Displaying results...")
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(image)
+    plt.title("Original")
+    plt.axis("off")
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(reconstructed_image)
+    plt.title("Reconstructed")
+    plt.axis("off")
+    
+    plt.show()
+
+    print("\nQuality Metrics:")
+    print(f"PSNR: {metrics['psnr']:.2f} dB")
+    print(f"SSIM: {metrics['ssim']:.4f}")
+    print(f"Entropy (Original): {metrics['entropy_orig']:.4f}")
+    print(f"Entropy (Reconstructed): {metrics['entropy_rec']:.4f}")
+    print(f"Histogram Correlation: {metrics['hist_corr']:.4f}")
+        
+
+if __name__ == "__main__":
+    main()
